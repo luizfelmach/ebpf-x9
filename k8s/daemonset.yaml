@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: x9
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: x9
+  template:
+    metadata:
+      labels:
+        app: x9
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: x9
+          image: x9:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/app/bin/x9"]
+          args: ["eth0", "/var/log/x9/events.ndjson", "/app/bin/x9.bpf.o"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: events
+              mountPath: /var/log/x9
+      volumes:
+        - name: events
+          hostPath:
+            path: /var/log/x9
+            type: DirectoryOrCreate
