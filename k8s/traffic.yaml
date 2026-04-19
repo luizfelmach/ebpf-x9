@@ -1,0 +1,190 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: x9-demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-a
+  namespace: x9-demo
+  labels:
+    app: traffic-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traffic-a
+  template:
+    metadata:
+      labels:
+        app: traffic-a
+    spec:
+      containers:
+        - name: traffic-a
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /www
+              echo "traffic-a" > /www/index.html
+              httpd -f -p 8080 -h /www &
+              while true; do
+                wget -q -O /dev/null http://traffic-b:80/ || true
+                wget -q -O /dev/null http://traffic-c:80/ || true
+                wget -q -O /dev/null http://example.com/ || true
+                sleep 1
+              done
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 150m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: traffic-a
+  namespace: x9-demo
+  labels:
+    app: traffic-a
+spec:
+  selector:
+    app: traffic-a
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-b
+  namespace: x9-demo
+  labels:
+    app: traffic-b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traffic-b
+  template:
+    metadata:
+      labels:
+        app: traffic-b
+    spec:
+      containers:
+        - name: traffic-b
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /www
+              echo "traffic-b" > /www/index.html
+              httpd -f -p 8080 -h /www &
+              while true; do
+                wget -q -O /dev/null http://traffic-c:80/ || true
+                wget -q -O /dev/null http://traffic-a:80/ || true
+                wget -q -O /dev/null http://example.com/ || true
+                sleep 1
+              done
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 150m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: traffic-b
+  namespace: x9-demo
+  labels:
+    app: traffic-b
+spec:
+  selector:
+    app: traffic-b
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-c
+  namespace: x9-demo
+  labels:
+    app: traffic-c
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traffic-c
+  template:
+    metadata:
+      labels:
+        app: traffic-c
+    spec:
+      containers:
+        - name: traffic-c
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /www
+              echo "traffic-c" > /www/index.html
+              httpd -f -p 8080 -h /www &
+              while true; do
+                wget -q -O /dev/null http://traffic-a:80/ || true
+                wget -q -O /dev/null http://traffic-b:80/ || true
+                wget -q -O /dev/null http://example.com/ || true
+                sleep 1
+              done
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 150m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: traffic-c
+  namespace: x9-demo
+  labels:
+    app: traffic-c
+spec:
+  selector:
+    app: traffic-c
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  type: ClusterIP

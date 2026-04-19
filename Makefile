@@ -27,7 +27,7 @@ IMAGE ?= x9:latest
 KIND_CLUSTER ?= cluster-x9
 KIND_CONFIG ?= kind/cluster-x9.yaml
 K8S_MANIFEST ?= k8s/daemonset.yaml
-K8S_NGINX_MANIFEST ?= k8s/nginx.yaml
+K8S_TRAFFIC_MANIFEST ?= k8s/traffic.yaml
 K8S_OBSERVABILITY_MANIFEST ?= k8s/observability.yaml
 K8S_NAMESPACE ?= kube-system
 OBS_NAMESPACE ?= observability
@@ -121,7 +121,7 @@ kind-load:
 	kind load docker-image $(IMAGE) --name $(KIND_CLUSTER)
 
 k8s-apply:
-	kubectl apply -f $(K8S_MANIFEST) -f $(K8S_NGINX_MANIFEST) -f $(K8S_OBSERVABILITY_MANIFEST)
+	kubectl apply -f $(K8S_MANIFEST) -f $(K8S_TRAFFIC_MANIFEST) -f $(K8S_OBSERVABILITY_MANIFEST)
 
 k8s-restart:
 	kubectl -n $(K8S_NAMESPACE) rollout restart daemonset/$(DAEMONSET_NAME)
@@ -161,7 +161,7 @@ port-forward: ## Expose Grafana on localhost
 
 undeploy: ## Delete Kubernetes resources
 	kubectl delete -f $(K8S_MANIFEST) --ignore-not-found
-	kubectl delete -f $(K8S_NGINX_MANIFEST) --ignore-not-found
+	kubectl delete -f $(K8S_TRAFFIC_MANIFEST) --ignore-not-found
 	kubectl delete -f $(K8S_OBSERVABILITY_MANIFEST) --ignore-not-found
 
 redeploy: ## Reapply and restart DaemonSet
