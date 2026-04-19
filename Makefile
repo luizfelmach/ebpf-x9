@@ -4,18 +4,24 @@ BPF_CLANG ?= clang
 CC ?= gcc
 ARCH ?= $(shell uname -m)
 
+BPF_TARGET_ARCH := $(ARCH)
+ifeq ($(ARCH),x86_64)
+BPF_TARGET_ARCH := x86
+else ifeq ($(ARCH),aarch64)
+BPF_TARGET_ARCH := arm64
+endif
+
 BPF_SRC := src/x9.bpf.c
 USER_SRC := src/x9.c
 BIN_DIR := bin
 BPF_OBJ := $(BIN_DIR)/x9.bpf.o
 BIN := $(BIN_DIR)/x9
 
-BPF_CFLAGS := -O2 -g -target bpf -I/usr/include/$(ARCH)-linux-gnu
+BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(BPF_TARGET_ARCH) -I/usr/include/$(ARCH)-linux-gnu
 USER_CFLAGS := -O2 -g
 USER_LDFLAGS := -lbpf -lelf -lz
 
-IFACE ?= eth0
-OUTPUT_FILE ?= /tmp/tc-events.ndjson
+OUTPUT_FILE ?= /tmp/x9-events.csv
 
 IMAGE ?= x9:latest
 KIND_CLUSTER ?= cluster-x9
@@ -24,12 +30,12 @@ K8S_MANIFEST ?= k8s/daemonset.yaml
 K8S_NAMESPACE ?= kube-system
 DAEMONSET_NAME ?= x9
 TAIL ?= 100
-EVENT_FILE ?= /var/log/x9/events.ndjson
+EVENT_FILE ?= /var/log/x9/events.csv
 
 .PHONY: help tools build build-bpf build-user run clean docker-build kind-up kind-down kind-reset kind-load k8s-apply k8s-restart k8s-status k8s-logs deploy-kind deploy status logs tail undeploy redeploy
 
 help: ## Show this help message
-	@printf "\n\033[1mX9 eBPF TC Monitor\033[0m\n"
+	@printf "\n\033[1mX9 eBPF Connection Monitor\033[0m\n"
 	@printf "\033[2mMain project commands\033[0m\n\n"
 	@printf "Usage: make <target> [VAR=value]\n\n"
 	@printf "\033[1mBuild and Local\033[0m\n"
@@ -47,12 +53,12 @@ help: ## Show this help message
 	@printf "  \033[36m%-14s\033[0m %s\n" "deploy" "Build image and deploy to kind"
 	@printf "  \033[36m%-14s\033[0m %s\n" "status" "Show daemonset and pod status"
 	@printf "  \033[36m%-14s\033[0m %s\n" "logs" "Follow DaemonSet logs"
-	@printf "  \033[36m%-14s\033[0m %s\n" "tail" "Tail NDJSON event file in pod"
+	@printf "  \033[36m%-14s\033[0m %s\n" "tail" "Tail CSV event file in pod"
 	@printf "  \033[36m%-14s\033[0m %s\n" "redeploy" "Reapply and restart DaemonSet"
 	@printf "  \033[36m%-14s\033[0m %s\n" "undeploy" "Delete Kubernetes resources"
 	@printf "\nExamples:\n"
 	@printf "  make build\n"
-	@printf "  make run IFACE=eth0 OUTPUT_FILE=/tmp/events.ndjson\n"
+	@printf "  make run OUTPUT_FILE=/tmp/events.csv\n"
 	@printf "  make deploy KIND_CLUSTER=dev\n\n"
 
 tools: ## Check required tools
@@ -88,7 +94,7 @@ $(BIN): $(USER_SRC) | $(BIN_DIR)
 	$(CC) $(USER_CFLAGS) $< -o $@ $(USER_LDFLAGS)
 
 run: build ## Run locally (requires sudo)
-	sudo ./$(BIN) $(IFACE) $(OUTPUT_FILE) $(BPF_OBJ)
+	sudo ./$(BIN) $(OUTPUT_FILE) $(BPF_OBJ)
 
 clean: ## Remove local build artifacts
 	rm -rf $(BIN_DIR)
@@ -131,7 +137,7 @@ status: ## Show daemonset and pod status
 logs: ## Follow DaemonSet logs
 	$(MAKE) k8s-logs
 
-tail: ## Tail NDJSON event file in pod
+tail: ## Tail CSV event file in pod
 	@POD=$$(kubectl -n $(K8S_NAMESPACE) get pods -l app=$(DAEMONSET_NAME) -o jsonpath='{.items[0].metadata.name}'); \
 	if [ -z "$$POD" ]; then \
 		echo "No pod found for app=$(DAEMONSET_NAME) in namespace $(K8S_NAMESPACE)"; \

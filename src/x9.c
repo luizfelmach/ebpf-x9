@@ -1,63 +1,22 @@
 #include <arpa/inet.h>
 #include <errno.h>
-#include <linux/if_ether.h>
-#include <linux/ip.h>
-#include <net/if.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
+#include "x9.h"
+
 static volatile sig_atomic_t stop;
 static FILE *output_file;
 
-struct tc_event {
-    __u64 ts_ns;
-    __u32 ifindex;
-    __u32 ingress_ifindex;
-    __u32 len;
-    __u32 mark;
-    __u32 priority;
-    __u32 queue_mapping;
-    __u16 protocol;
-    __u8 pkt_type;
-    __u8 tc_index;
-    __u32 hash;
-    __u32 tc_classid;
-    __u16 vlan_tci;
-    __u16 vlan_proto;
-    __u8 vlan_present;
-    __u8 pad0;
-    __u16 l3_proto;
-    __u8 src_mac[ETH_ALEN];
-    __u8 dst_mac[ETH_ALEN];
-    __u8 ip_version;
-    __u8 ip_ihl;
-    __u16 ip_tot_len;
-    __u16 ip_id;
-    __u16 ip_frag_off;
-    __u8 ip_proto;
-    __u8 ip_ttl;
-    __u8 ip_tos;
-    __u8 pad1;
-    __u16 ip_check;
-    __u32 src_ip;
-    __u32 dst_ip;
-    __u16 src_port;
-    __u16 dst_port;
-    __u32 tcp_seq;
-    __u32 tcp_ack;
-    __u16 tcp_window;
-    __u16 tcp_urg_ptr;
-    __u8 tcp_flags;
-    __u8 tcp_doff;
-    __u16 payload_len;
-};
+#define MAX_LINKS 16
 
 static void on_signal(int sig)
 {
@@ -65,57 +24,97 @@ static void on_signal(int sig)
     stop = 1;
 }
 
-static void mac_to_text(const __u8 mac[ETH_ALEN], char *out, size_t out_sz)
+static const char *event_type_to_text(__u32 type)
 {
-    snprintf(out,
-             out_sz,
-             "%02x:%02x:%02x:%02x:%02x:%02x",
-             mac[0],
-             mac[1],
-             mac[2],
-             mac[3],
-             mac[4],
-             mac[5]);
+    switch (type) {
+    case X9_EVENT_CONNECT:
+        return "connect";
+    case X9_EVENT_ACCEPT:
+        return "accept";
+    default:
+        return "unknown";
+    }
 }
 
-static void tcp_flags_to_text(__u8 flags, char *out, size_t out_sz)
+static void format_address(const struct x9_conn_event *event, char *out, size_t out_sz)
 {
-    size_t n = 0;
+    if (event->family == AF_INET) {
+        struct in_addr addr4 = { 0 };
 
-    if (!out_sz)
+        memcpy(&addr4.s_addr, event->addr, sizeof(addr4.s_addr));
+        if (inet_ntop(AF_INET, &addr4, out, out_sz))
+            return;
+    } else if (event->family == AF_INET6) {
+        struct in6_addr addr6 = { 0 };
+
+        memcpy(&addr6.s6_addr, event->addr, sizeof(addr6.s6_addr));
+        if (inet_ntop(AF_INET6, &addr6, out, out_sz))
+            return;
+    }
+
+    snprintf(out, out_sz, "-");
+}
+
+static unsigned long long monotonic_to_unix_ns(__u64 monotonic_ns)
+{
+    struct timespec realtime_ts = { 0 };
+    struct timespec monotonic_ts = { 0 };
+    unsigned long long realtime_ns;
+    unsigned long long monotonic_now_ns;
+
+    if (clock_gettime(CLOCK_REALTIME, &realtime_ts))
+        return 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &monotonic_ts))
+        return 0;
+
+    realtime_ns = (unsigned long long)realtime_ts.tv_sec * 1000000000ULL +
+                  (unsigned long long)realtime_ts.tv_nsec;
+    monotonic_now_ns = (unsigned long long)monotonic_ts.tv_sec * 1000000000ULL +
+                       (unsigned long long)monotonic_ts.tv_nsec;
+
+    if (realtime_ns < monotonic_now_ns)
+        return 0;
+
+    return (realtime_ns - monotonic_now_ns) + (unsigned long long)monotonic_ns;
+}
+
+static void format_iso8601_utc(unsigned long long unix_ns, char *out, size_t out_sz)
+{
+    time_t sec;
+    unsigned long nsec;
+    struct tm tm_utc = { 0 };
+
+    if (!unix_ns) {
+        snprintf(out, out_sz, "-");
         return;
+    }
 
-    if (flags & (1U << 1) && n + 1 < out_sz)
-        out[n++] = 'S';
-    if (flags & (1U << 4) && n + 1 < out_sz)
-        out[n++] = 'A';
-    if (flags & (1U << 3) && n + 1 < out_sz)
-        out[n++] = 'P';
-    if (flags & (1U << 2) && n + 1 < out_sz)
-        out[n++] = 'R';
-    if (flags & (1U << 0) && n + 1 < out_sz)
-        out[n++] = 'F';
-    if (flags & (1U << 5) && n + 1 < out_sz)
-        out[n++] = 'U';
-    if (flags & (1U << 6) && n + 1 < out_sz)
-        out[n++] = 'E';
-    if (flags & (1U << 7) && n + 1 < out_sz)
-        out[n++] = 'C';
+    sec = (time_t)(unix_ns / 1000000000ULL);
+    nsec = (unsigned long)(unix_ns % 1000000000ULL);
 
-    if (!n && out_sz > 1)
-        out[n++] = '-';
+    if (!gmtime_r(&sec, &tm_utc)) {
+        snprintf(out, out_sz, "-");
+        return;
+    }
 
-    out[n] = '\0';
+    snprintf(out,
+             out_sz,
+             "%04d-%02d-%02dT%02d:%02d:%02d.%09luZ",
+             tm_utc.tm_year + 1900,
+             tm_utc.tm_mon + 1,
+             tm_utc.tm_mday,
+             tm_utc.tm_hour,
+             tm_utc.tm_min,
+             tm_utc.tm_sec,
+             nsec);
 }
 
 static int on_event(void *ctx, void *data, size_t data_sz)
 {
-    const struct tc_event *event = data;
-    char src_mac[18] = "-";
-    char dst_mac[18] = "-";
-    char src_ip[INET_ADDRSTRLEN] = "-";
-    char dst_ip[INET_ADDRSTRLEN] = "-";
-    char flags_text[16] = "-";
+    const struct x9_conn_event *event = data;
+    char addr_text[INET6_ADDRSTRLEN] = "-";
+    char iso_ts[40] = "-";
+    unsigned long long unix_ns;
 
     (void)ctx;
 
@@ -124,96 +123,49 @@ static int on_event(void *ctx, void *data, size_t data_sz)
     if (data_sz < sizeof(*event))
         return 0;
 
-    mac_to_text(event->src_mac, src_mac, sizeof(src_mac));
-    mac_to_text(event->dst_mac, dst_mac, sizeof(dst_mac));
-    tcp_flags_to_text(event->tcp_flags, flags_text, sizeof(flags_text));
-
-    if (event->l3_proto == ETH_P_IP) {
-        struct in_addr src = { .s_addr = event->src_ip };
-        struct in_addr dst = { .s_addr = event->dst_ip };
-
-        inet_ntop(AF_INET, &src, src_ip, sizeof(src_ip));
-        inet_ntop(AF_INET, &dst, dst_ip, sizeof(dst_ip));
-    }
+    format_address(event, addr_text, sizeof(addr_text));
+    unix_ns = monotonic_to_unix_ns(event->ts_ns);
+    format_iso8601_utc(unix_ns, iso_ts, sizeof(iso_ts));
 
     fprintf(output_file,
-            "{\"ts_ns\":%llu,\"ifindex\":%u,\"ingress_ifindex\":%u,\"len\":%u,"
-            "\"mark\":%u,\"priority\":%u,\"queue_mapping\":%u,\"protocol\":%u,"
-            "\"pkt_type\":%u,\"tc_index\":%u,\"hash\":%u,\"tc_classid\":%u,"
-            "\"vlan_present\":%u,\"vlan_tci\":%u,\"vlan_proto\":%u,\"l3_proto\":%u,"
-            "\"src_mac\":\"%s\",\"dst_mac\":\"%s\",\"src_ip\":\"%s\",\"dst_ip\":\"%s\","
-            "\"ip_version\":%u,\"ip_ihl\":%u,\"ip_tot_len\":%u,\"ip_id\":%u,"
-            "\"ip_frag_off\":%u,\"ip_proto\":%u,\"ip_ttl\":%u,\"ip_tos\":%u,\"ip_check\":%u,"
-            "\"src_port\":%u,\"dst_port\":%u,\"tcp_seq\":%u,\"tcp_ack\":%u,\"tcp_window\":%u,"
-            "\"tcp_urg_ptr\":%u,\"tcp_flags\":%u,\"tcp_flags_text\":\"%s\",\"tcp_doff\":%u,"
-            "\"payload_len\":%u}\n",
+            "\"%llu\",\"%llu\",\"%s\",\"%s\",\"%u\",\"%u\",\"%u\",\"%s\",\"%d\",\"%d\",\"%d\",\"%u\",\"%s\",\"%u\",\"%u\"\n",
             (unsigned long long)event->ts_ns,
-            event->ifindex,
-            event->ingress_ifindex,
-            event->len,
-            event->mark,
-            event->priority,
-            event->queue_mapping,
-            event->protocol,
-            event->pkt_type,
-            event->tc_index,
-            event->hash,
-            event->tc_classid,
-            event->vlan_present,
-            event->vlan_tci,
-            event->vlan_proto,
-            event->l3_proto,
-            src_mac,
-            dst_mac,
-            src_ip,
-            dst_ip,
-            event->ip_version,
-            event->ip_ihl,
-            event->ip_tot_len,
-            event->ip_id,
-            event->ip_frag_off,
-            event->ip_proto,
-            event->ip_ttl,
-            event->ip_tos,
-            event->ip_check,
-            event->src_port,
-            event->dst_port,
-            event->tcp_seq,
-            event->tcp_ack,
-            event->tcp_window,
-            event->tcp_urg_ptr,
-            event->tcp_flags,
-            flags_text,
-            event->tcp_doff,
-            event->payload_len);
+            unix_ns,
+            iso_ts,
+            event_type_to_text(event->type),
+            event->pid,
+            event->tid,
+            event->uid,
+            event->comm,
+            event->fd,
+            event->ret,
+            event->flags,
+            event->family,
+            addr_text,
+            event->port,
+            event->addrlen);
 
     return 0;
 }
 
 int main(int argc, char **argv)
 {
-    const char *ifname = argc > 1 ? argv[1] : "eth0";
-    const char *output_path = argc > 2 ? argv[2] : "/var/log/tc-events.ndjson";
-    const char *bpf_obj_path = argc > 3 ? argv[3] : "x9.bpf.o";
-    int ifindex = if_nametoindex(ifname);
+    const char *output_path = argc > 1 ? argv[1] : "/var/log/x9/events.csv";
+    const char *bpf_obj_path = argc > 2 ? argv[2] : "x9.bpf.o";
     struct bpf_object *obj = NULL;
     struct bpf_program *prog;
-    struct bpf_tc_hook hook = { 0 };
-    struct bpf_tc_opts attach_opts = { 0 };
-    struct bpf_tc_opts detach_opts = { 0 };
+    struct bpf_link *links[MAX_LINKS] = { 0 };
     struct ring_buffer *rb = NULL;
-    bool hook_created = false;
-    int prog_fd;
+    size_t link_count = 0;
+    bool has_connect_enter = false;
+    bool has_connect_exit = false;
+    bool has_accept_enter = false;
+    bool has_accept_exit = false;
     int map_fd;
     int err;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
-
-    if (!ifindex) {
-        fprintf(stderr, "invalid interface: %s\n", ifname);
-        return 1;
-    }
 
     output_file = fopen(output_path, "a");
     if (!output_file) {
@@ -240,22 +192,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    prog = bpf_object__find_program_by_name(obj, "inspect_tc");
-    if (!prog) {
-        fprintf(stderr, "BPF program 'inspect_tc' not found\n");
-        bpf_object__close(obj);
-        fclose(output_file);
-        return 1;
-    }
-
-    prog_fd = bpf_program__fd(prog);
-    if (prog_fd < 0) {
-        fprintf(stderr, "failed to get program fd\n");
-        bpf_object__close(obj);
-        fclose(output_file);
-        return 1;
-    }
-
     map_fd = bpf_object__find_map_fd_by_name(obj, "events");
     if (map_fd < 0) {
         fprintf(stderr, "map 'events' not found\n");
@@ -272,64 +208,80 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    hook.sz = sizeof(hook);
-    hook.ifindex = ifindex;
-    hook.attach_point = BPF_TC_INGRESS;
+    bpf_object__for_each_program(prog, obj) {
+        struct bpf_link *link;
+        const char *prog_name;
 
-    err = bpf_tc_hook_create(&hook);
-    if (err && err != -EEXIST) {
-        fprintf(stderr, "failed to create TC hook on %s: %s\n", ifname, strerror(-err));
-        ring_buffer__free(rb);
-        bpf_object__close(obj);
-        fclose(output_file);
-        return 1;
-    }
-    if (!err)
-        hook_created = true;
+        if (link_count >= MAX_LINKS) {
+            fprintf(stderr, "too many BPF programs; increase MAX_LINKS\n");
+            err = -E2BIG;
+            goto cleanup;
+        }
 
-    attach_opts.sz = sizeof(attach_opts);
-    attach_opts.prog_fd = prog_fd;
-    attach_opts.handle = 1;
-    attach_opts.priority = 1;
-    attach_opts.flags = 0;
+        link = bpf_program__attach(prog);
+        err = (int)libbpf_get_error(link);
+        if (err) {
+            if (err == -ENOENT || err == -ESRCH)
+                continue;
+            fprintf(stderr, "failed to attach program '%s': %s\n",
+                    bpf_program__name(prog),
+                    strerror(-err));
+            goto cleanup;
+        }
 
-    err = bpf_tc_attach(&hook, &attach_opts);
-    if (err == -EEXIST) {
-        attach_opts.flags = BPF_TC_F_REPLACE;
-        err = bpf_tc_attach(&hook, &attach_opts);
-    }
-    if (err) {
-        fprintf(stderr, "failed to attach TC program on %s: %s\n", ifname, strerror(-err));
-        if (hook_created)
-            bpf_tc_hook_destroy(&hook);
-        ring_buffer__free(rb);
-        bpf_object__close(obj);
-        fclose(output_file);
-        return 1;
+        prog_name = bpf_program__name(prog);
+        if (!strncmp(prog_name, "kprobe_", 7) && strstr(prog_name, "_sys_connect"))
+            has_connect_enter = true;
+        else if (!strncmp(prog_name, "kretprobe_", 10) && strstr(prog_name, "_sys_connect"))
+            has_connect_exit = true;
+        else if (!strncmp(prog_name, "kprobe_", 7) && strstr(prog_name, "_sys_accept"))
+            has_accept_enter = true;
+        else if (!strncmp(prog_name, "kretprobe_", 10) && strstr(prog_name, "_sys_accept"))
+            has_accept_exit = true;
+
+        links[link_count++] = link;
     }
 
-    detach_opts.sz = sizeof(detach_opts);
-    detach_opts.handle = 1;
-    detach_opts.priority = 1;
+    if (!link_count) {
+        fprintf(stderr, "no compatible kprobe could be attached\n");
+        err = -ENOENT;
+        goto cleanup;
+    }
 
-    printf("TC program attached on %s (ingress). Writing events to %s (Ctrl+C to exit)\n",
-           ifname,
-           output_path);
+    if (!has_connect_enter || !has_connect_exit) {
+        fprintf(stderr, "connect probes could not be attached on this kernel\n");
+        err = -ENOENT;
+        goto cleanup;
+    }
+
+    if (!has_accept_enter || !has_accept_exit) {
+        fprintf(stderr, "accept probes could not be attached on this kernel\n");
+        err = -ENOENT;
+        goto cleanup;
+    }
+
+    err = 0;
+    printf("Syscall kprobes attached. Writing events to %s (Ctrl+C to exit)\n", output_path);
     while (!stop) {
         err = ring_buffer__poll(rb, 500);
-        if (err == -EINTR)
+        if (err == -EINTR) {
+            err = 0;
             break;
+        }
         if (err < 0) {
-            fprintf(stderr, "failed to read TC events: %d\n", err);
+            fprintf(stderr, "failed to read syscall events: %d\n", err);
             break;
         }
     }
 
-    bpf_tc_detach(&hook, &detach_opts);
-    if (hook_created)
-        bpf_tc_hook_destroy(&hook);
+cleanup:
+    for (size_t i = 0; i < link_count; i++)
+        bpf_link__destroy(links[i]);
     ring_buffer__free(rb);
     bpf_object__close(obj);
     fclose(output_file);
+
+    if (err)
+        return 1;
     return 0;
 }

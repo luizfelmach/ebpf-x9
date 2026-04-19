@@ -1,168 +1,244 @@
 #include <linux/bpf.h>
-#include <linux/if_ether.h>
 #include <linux/in.h>
-#include <linux/ip.h>
-#include <linux/pkt_cls.h>
-#include <linux/tcp.h>
+#include <linux/in6.h>
+#include <linux/ptrace.h>
+#include <linux/socket.h>
+
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+
+#include "x9.h"
+
+#ifndef AF_INET
+#define AF_INET 2
+#endif
+
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
+
+struct sockaddr_in_user {
+    __u16 sin_family;
+    __be16 sin_port;
+    __u32 sin_addr;
+    __u8 sin_zero[8];
+};
+
+struct sockaddr_in6_user {
+    __u16 sin6_family;
+    __be16 sin6_port;
+    __u32 sin6_flowinfo;
+    __u8 sin6_addr[16];
+    __u32 sin6_scope_id;
+};
+
+struct connect_args {
+    __s32 fd;
+    __s32 addrlen;
+    __u64 user_sockaddr;
+    __u32 uid;
+    char comm[X9_COMM_LEN];
+};
+
+struct accept_args {
+    __s32 fd;
+    __s32 flags;
+    __u64 user_sockaddr;
+    __u64 user_addrlen;
+    __u32 uid;
+    char comm[X9_COMM_LEN];
+};
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 24);
 } events SEC(".maps");
 
-struct tc_event {
-    __u64 ts_ns;
-    __u32 ifindex;
-    __u32 ingress_ifindex;
-    __u32 len;
-    __u32 mark;
-    __u32 priority;
-    __u32 queue_mapping;
-    __u16 protocol;
-    __u8 pkt_type;
-    __u8 tc_index;
-    __u32 hash;
-    __u32 tc_classid;
-    __u16 vlan_tci;
-    __u16 vlan_proto;
-    __u8 vlan_present;
-    __u8 pad0;
-    __u16 l3_proto;
-    __u8 src_mac[ETH_ALEN];
-    __u8 dst_mac[ETH_ALEN];
-    __u8 ip_version;
-    __u8 ip_ihl;
-    __u16 ip_tot_len;
-    __u16 ip_id;
-    __u16 ip_frag_off;
-    __u8 ip_proto;
-    __u8 ip_ttl;
-    __u8 ip_tos;
-    __u8 pad1;
-    __u16 ip_check;
-    __u32 src_ip;
-    __u32 dst_ip;
-    __u16 src_port;
-    __u16 dst_port;
-    __u32 tcp_seq;
-    __u32 tcp_ack;
-    __u16 tcp_window;
-    __u16 tcp_urg_ptr;
-    __u8 tcp_flags;
-    __u8 tcp_doff;
-    __u16 payload_len;
-};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u64);
+    __type(value, struct connect_args);
+    __uint(max_entries, 16384);
+} connect_inflight SEC(".maps");
 
-static __always_inline void fill_payload_len(void *payload, void *data_end, struct tc_event *event)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u64);
+    __type(value, struct accept_args);
+    __uint(max_entries, 16384);
+} accept_inflight SEC(".maps");
+
+static __always_inline __u16 clamp_addrlen(__u32 addrlen)
 {
-    __u64 payload_bytes;
+    if (addrlen > 0xffff)
+        return 0xffff;
+    return (__u16)addrlen;
+}
 
-    if (payload > data_end)
+static __always_inline void fill_address(__u64 user_sockaddr, __u32 addrlen, struct x9_conn_event *event)
+{
+    __u16 family;
+
+    if (!user_sockaddr || addrlen < sizeof(family))
         return;
 
-    payload_bytes = (__u64)((long)data_end - (long)payload);
-    event->payload_len = payload_bytes > 0xffff ? 0xffff : (__u16)payload_bytes;
-}
-
-static __always_inline void fill_ipv4_fields(struct iphdr *iph, struct tc_event *event)
-{
-    event->ip_version = iph->version;
-    event->ip_ihl = iph->ihl;
-    event->ip_tot_len = bpf_ntohs(iph->tot_len);
-    event->ip_id = bpf_ntohs(iph->id);
-    event->ip_frag_off = bpf_ntohs(iph->frag_off);
-    event->ip_proto = iph->protocol;
-    event->ip_ttl = iph->ttl;
-    event->ip_tos = iph->tos;
-    event->ip_check = bpf_ntohs(iph->check);
-    event->src_ip = iph->saddr;
-    event->dst_ip = iph->daddr;
-}
-
-static __always_inline void fill_tcp_fields(struct tcphdr *tcph, void *data_end, struct tc_event *event)
-{
-    __u16 doff = tcph->doff * 4;
-    void *payload;
-
-    event->src_port = bpf_ntohs(tcph->source);
-    event->dst_port = bpf_ntohs(tcph->dest);
-    event->tcp_seq = bpf_ntohl(tcph->seq);
-    event->tcp_ack = bpf_ntohl(tcph->ack_seq);
-    event->tcp_window = bpf_ntohs(tcph->window);
-    event->tcp_urg_ptr = bpf_ntohs(tcph->urg_ptr);
-    event->tcp_flags = ((__u8)tcph->fin) |
-                       ((__u8)tcph->syn << 1) |
-                       ((__u8)tcph->rst << 2) |
-                       ((__u8)tcph->psh << 3) |
-                       ((__u8)tcph->ack << 4) |
-                       ((__u8)tcph->urg << 5) |
-                       ((__u8)tcph->ece << 6) |
-                       ((__u8)tcph->cwr << 7);
-    event->tcp_doff = tcph->doff;
-
-    if (doff < sizeof(*tcph))
+    if (bpf_probe_read_user(&family, sizeof(family), (void *)(long)user_sockaddr))
         return;
 
-    payload = (void *)tcph + doff;
-    fill_payload_len(payload, data_end, event);
+    event->family = family;
+    event->addrlen = clamp_addrlen(addrlen);
+
+    if (family == AF_INET && addrlen >= sizeof(struct sockaddr_in_user)) {
+        struct sockaddr_in_user sa4;
+
+        if (!bpf_probe_read_user(&sa4, sizeof(sa4), (void *)(long)user_sockaddr)) {
+            event->port = bpf_ntohs(sa4.sin_port);
+            __builtin_memcpy(event->addr, &sa4.sin_addr, sizeof(sa4.sin_addr));
+        }
+        return;
+    }
+
+    if (family == AF_INET6 && addrlen >= sizeof(struct sockaddr_in6_user)) {
+        struct sockaddr_in6_user sa6;
+
+        if (!bpf_probe_read_user(&sa6, sizeof(sa6), (void *)(long)user_sockaddr)) {
+            event->port = bpf_ntohs(sa6.sin6_port);
+            __builtin_memcpy(event->addr, sa6.sin6_addr, sizeof(sa6.sin6_addr));
+        }
+    }
 }
 
-SEC("tc")
-int inspect_tc(struct __sk_buff *skb)
+static __always_inline void fill_identity(struct x9_conn_event *event, __u64 pid_tgid, __u32 uid, const char comm[X9_COMM_LEN])
 {
-    struct tc_event *event;
-    void *data = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
-    struct ethhdr *eth = data;
-
-    event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-    if (!event)
-        return TC_ACT_OK;
-
-    __builtin_memset(event, 0, sizeof(*event));
     event->ts_ns = bpf_ktime_get_ns();
-    event->ifindex = skb->ifindex;
-    event->ingress_ifindex = skb->ingress_ifindex;
-    event->len = skb->len;
-    event->mark = skb->mark;
-    event->priority = skb->priority;
-    event->queue_mapping = skb->queue_mapping;
-    event->protocol = bpf_ntohs(skb->protocol);
-    event->pkt_type = skb->pkt_type;
-    event->tc_index = skb->tc_index;
-    event->hash = skb->hash;
-    event->tc_classid = skb->tc_classid;
-    event->vlan_present = skb->vlan_present;
-    event->vlan_tci = skb->vlan_tci;
-    event->vlan_proto = bpf_ntohs(skb->vlan_proto);
+    event->pid = pid_tgid >> 32;
+    event->tid = (__u32)pid_tgid;
+    event->uid = uid;
+    __builtin_memcpy(event->comm, comm, X9_COMM_LEN);
+}
 
-    if ((void *)(eth + 1) <= data_end) {
-        __u16 l3_proto = bpf_ntohs(eth->h_proto);
+static __always_inline int save_connect_args(__s32 fd, __u64 user_sockaddr, __s32 addrlen)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct connect_args args = {};
 
-        __builtin_memcpy(event->src_mac, eth->h_source, ETH_ALEN);
-        __builtin_memcpy(event->dst_mac, eth->h_dest, ETH_ALEN);
-        event->l3_proto = l3_proto;
+    args.fd = fd;
+    args.user_sockaddr = user_sockaddr;
+    args.addrlen = addrlen;
+    args.uid = (__u32)bpf_get_current_uid_gid();
+    bpf_get_current_comm(args.comm, sizeof(args.comm));
+    bpf_map_update_elem(&connect_inflight, &pid_tgid, &args, BPF_ANY);
+    return 0;
+}
 
-        if (l3_proto == ETH_P_IP) {
-            struct iphdr *iph = (void *)(eth + 1);
+static __always_inline int submit_connect_event(long ret)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct connect_args *args;
+    struct x9_conn_event *event;
 
-            if ((void *)(iph + 1) <= data_end) {
-                fill_ipv4_fields(iph, event);
+    args = bpf_map_lookup_elem(&connect_inflight, &pid_tgid);
+    if (!args)
+        return 0;
 
-                if (iph->protocol == IPPROTO_TCP) {
-                    struct tcphdr *tcph = (void *)iph + (iph->ihl * 4);
+    if (ret == 0) {
+        __u32 addrlen = args->addrlen > 0 ? (__u32)args->addrlen : 0;
 
-                    if ((void *)(tcph + 1) <= data_end)
-                        fill_tcp_fields(tcph, data_end, event);
-                }
-            }
+        event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+        if (event) {
+            __builtin_memset(event, 0, sizeof(*event));
+            fill_identity(event, pid_tgid, args->uid, args->comm);
+            event->type = X9_EVENT_CONNECT;
+            event->fd = args->fd;
+            event->ret = (__s32)ret;
+            fill_address(args->user_sockaddr, addrlen, event);
+            bpf_ringbuf_submit(event, 0);
         }
     }
 
-    bpf_ringbuf_submit(event, 0);
-    return TC_ACT_OK;
+    bpf_map_delete_elem(&connect_inflight, &pid_tgid);
+    return 0;
+}
+
+static __always_inline int save_accept_args(__s32 fd, __u64 user_sockaddr, __u64 user_addrlen, __s32 flags)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct accept_args args = {};
+
+    args.fd = fd;
+    args.user_sockaddr = user_sockaddr;
+    args.user_addrlen = user_addrlen;
+    args.flags = flags;
+    args.uid = (__u32)bpf_get_current_uid_gid();
+    bpf_get_current_comm(args.comm, sizeof(args.comm));
+    bpf_map_update_elem(&accept_inflight, &pid_tgid, &args, BPF_ANY);
+    return 0;
+}
+
+static __always_inline int submit_accept_event(long ret)
+{
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct accept_args *args;
+    struct x9_conn_event *event;
+    __u32 addrlen = 0;
+
+    args = bpf_map_lookup_elem(&accept_inflight, &pid_tgid);
+    if (!args)
+        return 0;
+
+    if (ret >= 0) {
+        if (args->user_addrlen) {
+            __u32 len = 0;
+
+            if (!bpf_probe_read_user(&len, sizeof(len), (void *)(long)args->user_addrlen))
+                addrlen = len;
+        }
+
+        event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+        if (event) {
+            __builtin_memset(event, 0, sizeof(*event));
+            fill_identity(event, pid_tgid, args->uid, args->comm);
+            event->type = X9_EVENT_ACCEPT;
+            event->fd = args->fd;
+            event->ret = (__s32)ret;
+            event->flags = args->flags;
+            fill_address(args->user_sockaddr, addrlen, event);
+            bpf_ringbuf_submit(event, 0);
+        }
+    }
+
+    bpf_map_delete_elem(&accept_inflight, &pid_tgid);
+    return 0;
+}
+
+SEC("kprobe/__sys_connect")
+int kprobe_sys_connect(struct pt_regs *ctx)
+{
+    return save_connect_args((__s32)PT_REGS_PARM1(ctx),
+                             (__u64)PT_REGS_PARM2(ctx),
+                             (__s32)PT_REGS_PARM3(ctx));
+}
+
+SEC("kretprobe/__sys_connect")
+int kretprobe_sys_connect(struct pt_regs *ctx)
+{
+    return submit_connect_event(PT_REGS_RC(ctx));
+}
+
+SEC("kprobe/__sys_accept4")
+int kprobe_sys_accept4(struct pt_regs *ctx)
+{
+    return save_accept_args((__s32)PT_REGS_PARM1(ctx),
+                             (__u64)PT_REGS_PARM2(ctx),
+                             (__u64)PT_REGS_PARM3(ctx),
+                             (__s32)PT_REGS_PARM4(ctx));
+}
+
+SEC("kretprobe/__sys_accept4")
+int kretprobe_sys_accept4(struct pt_regs *ctx)
+{
+    return submit_accept_event(PT_REGS_RC(ctx));
 }
 
 char LICENSE[] SEC("license") = "GPL";

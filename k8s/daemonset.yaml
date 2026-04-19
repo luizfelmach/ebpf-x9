@@ -26,7 +26,7 @@ spec:
           image: x9:latest
           imagePullPolicy: IfNotPresent
           command: ["/app/bin/x9"]
-          args: ["eth0", "/var/log/x9/events.ndjson", "/app/bin/x9.bpf.o"]
+          args: ["/var/log/x9/events.csv", "/app/bin/x9.bpf.o"]
           securityContext:
             privileged: true
           volumeMounts:
