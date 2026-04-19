@@ -21,7 +21,7 @@ BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(BPF_TARGET_ARCH) -I/usr/inclu
 USER_CFLAGS := -O2 -g
 USER_LDFLAGS := -lbpf -lelf -lz
 
-OUTPUT_FILE ?= /tmp/x9-events.csv
+OUTPUT_FILE ?= /tmp/x9-events.json
 
 IMAGE ?= x9:latest
 KIND_CLUSTER ?= cluster-x9
@@ -31,7 +31,7 @@ K8S_NGINX_MANIFEST ?= k8s/nginx.yaml
 K8S_NAMESPACE ?= kube-system
 DAEMONSET_NAME ?= x9
 TAIL ?= 100
-EVENT_FILE ?= /var/log/x9/events.csv
+EVENT_FILE ?= /var/log/x9/events.json
 
 .PHONY: help tools build build-bpf build-user run clean docker-build kind-up kind-down kind-reset kind-load k8s-apply k8s-restart k8s-status k8s-logs deploy-kind deploy status logs tail undeploy redeploy
 
@@ -54,12 +54,12 @@ help: ## Show this help message
 	@printf "  \033[36m%-14s\033[0m %s\n" "deploy" "Build image and deploy to kind"
 	@printf "  \033[36m%-14s\033[0m %s\n" "status" "Show daemonset and pod status"
 	@printf "  \033[36m%-14s\033[0m %s\n" "logs" "Follow DaemonSet logs"
-	@printf "  \033[36m%-14s\033[0m %s\n" "tail" "Tail CSV event file in pod"
+	@printf "  \033[36m%-14s\033[0m %s\n" "tail" "Tail NDJSON event file in pod"
 	@printf "  \033[36m%-14s\033[0m %s\n" "redeploy" "Reapply and restart DaemonSet"
 	@printf "  \033[36m%-14s\033[0m %s\n" "undeploy" "Delete Kubernetes resources"
 	@printf "\nExamples:\n"
 	@printf "  make build\n"
-	@printf "  make run OUTPUT_FILE=/tmp/events.csv\n"
+	@printf "  make run OUTPUT_FILE=/tmp/events.json\n"
 	@printf "  make deploy KIND_CLUSTER=dev\n\n"
 
 tools: ## Check required tools
@@ -138,7 +138,7 @@ status: ## Show daemonset and pod status
 logs: ## Follow DaemonSet logs
 	$(MAKE) k8s-logs
 
-tail: ## Tail CSV event file in pod
+tail: ## Tail NDJSON event file in pod
 	@POD=$$(kubectl -n $(K8S_NAMESPACE) get pods -l app=$(DAEMONSET_NAME) -o jsonpath='{.items[0].metadata.name}'); \
 	if [ -z "$$POD" ]; then \
 		echo "No pod found for app=$(DAEMONSET_NAME) in namespace $(K8S_NAMESPACE)"; \

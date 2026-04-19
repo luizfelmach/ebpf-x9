@@ -19,4 +19,4 @@ RUN mkdir -p /app/bin && \
     clang -O2 -g -target bpf -D__TARGET_ARCH_${BPF_ARCH} -I/usr/include/$ARCH-linux-gnu -c x9.bpf.c -o /app/bin/x9.bpf.o && \
     gcc -O2 -g x9.c -o /app/bin/x9 -lbpf -lelf -lz
 
-CMD ["/app/bin/x9", "/var/log/x9/events.csv", "/app/bin/x9.bpf.o"]
+CMD ["/app/bin/x9", "/var/log/x9/events.json", "/app/bin/x9.bpf.o"]

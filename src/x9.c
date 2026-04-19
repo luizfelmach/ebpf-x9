@@ -121,6 +121,52 @@ static void format_iso8601_utc(unsigned long long unix_ns, char *out, size_t out
              nsec);
 }
 
+static void json_write_escaped_string(FILE *file, const char *text)
+{
+    const unsigned char *p = (const unsigned char *)text;
+
+    fputc('"', file);
+    if (!text) {
+        fputc('"', file);
+        return;
+    }
+
+    while (*p) {
+        switch (*p) {
+        case '"':
+            fputs("\\\"", file);
+            break;
+        case '\\':
+            fputs("\\\\", file);
+            break;
+        case '\b':
+            fputs("\\b", file);
+            break;
+        case '\f':
+            fputs("\\f", file);
+            break;
+        case '\n':
+            fputs("\\n", file);
+            break;
+        case '\r':
+            fputs("\\r", file);
+            break;
+        case '\t':
+            fputs("\\t", file);
+            break;
+        default:
+            if (*p < 0x20)
+                fprintf(file, "\\u%04x", (unsigned int)*p);
+            else
+                fputc(*p, file);
+            break;
+        }
+        p++;
+    }
+
+    fputc('"', file);
+}
+
 struct cgroup_entry {
     __u64 id;
     char pod_uid[X9_POD_UID_LEN];
@@ -715,31 +761,40 @@ static int on_event(void *ctx, void *data, size_t data_sz)
     }
 
     fprintf(output_file,
-            "\"%llu\",\"%llu\",\"%s\",\"%s\",\"%u\",\"%u\",\"%u\",\"%s\",\"%d\",\"%d\",\"%d\",\"%u\",\"%s\",\"%u\",\"%u\",\"%s\",\"%s\"\n",
+            "{\"ts_ns\":%llu,\"unix_ns\":%llu,\"iso_ts\":",
             (unsigned long long)event->ts_ns,
-            unix_ns,
-            iso_ts,
-            event_type_to_text(event->type),
+            unix_ns);
+    json_write_escaped_string(output_file, iso_ts);
+    fputs(",\"event_type\":", output_file);
+    json_write_escaped_string(output_file, event_type_to_text(event->type));
+    fprintf(output_file,
+            ",\"pid\":%u,\"tid\":%u,\"uid\":%u,\"comm\":",
             event->pid,
             event->tid,
-            event->uid,
-            event->comm,
+            event->uid);
+    json_write_escaped_string(output_file, event->comm);
+    fprintf(output_file,
+            ",\"fd\":%d,\"ret\":%d,\"flags\":%d,\"family\":%u,\"addr\":",
             event->fd,
             event->ret,
             event->flags,
-            event->family,
-            addr_text,
+            event->family);
+    json_write_escaped_string(output_file, addr_text);
+    fprintf(output_file,
+            ",\"port\":%u,\"addrlen\":%u,\"pod_namespace\":",
             event->port,
-            event->addrlen,
-            pod_namespace,
-            pod_name);
+            event->addrlen);
+    json_write_escaped_string(output_file, pod_namespace);
+    fputs(",\"pod_name\":", output_file);
+    json_write_escaped_string(output_file, pod_name);
+    fputs("}\n", output_file);
 
     return 0;
 }
 
 int main(int argc, char **argv)
 {
-    const char *output_path = argc > 1 ? argv[1] : "/var/log/x9/events.csv";
+    const char *output_path = argc > 1 ? argv[1] : "/var/log/x9/events.json";
     const char *bpf_obj_path = argc > 2 ? argv[2] : "x9.bpf.o";
     struct bpf_object *obj = NULL;
     struct bpf_program *prog;
