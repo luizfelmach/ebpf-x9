@@ -133,6 +133,7 @@ static __always_inline void fill_address(__u64 user_sockaddr, __u32 addrlen, str
 static __always_inline void fill_identity(struct x9_conn_event *event, __u64 pid_tgid, __u32 uid, const char comm[X9_COMM_LEN])
 {
     event->ts_ns = bpf_ktime_get_ns();
+    event->cgroup_id = bpf_get_current_cgroup_id();
     event->pid = pid_tgid >> 32;
     event->tid = (__u32)pid_tgid;
     event->uid = uid;

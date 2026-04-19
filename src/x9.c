@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -25,6 +26,9 @@ static FILE *output_file;
 
 #define MAX_LINKS 16
 #define CGROUP_SYNC_INTERVAL_SEC 5
+#define X9_POD_UID_LEN 37
+#define X9_POD_NAMESPACE_LEN 64
+#define X9_POD_NAME_LEN 256
 
 static void on_signal(int sig)
 {
@@ -117,49 +121,165 @@ static void format_iso8601_utc(unsigned long long unix_ns, char *out, size_t out
              nsec);
 }
 
+struct cgroup_entry {
+    __u64 id;
+    char pod_uid[X9_POD_UID_LEN];
+};
+
 struct cgroup_id_set {
-    __u64 *ids;
+    struct cgroup_entry *entries;
     size_t count;
     size_t capacity;
 };
 
+struct pod_identity {
+    char uid[X9_POD_UID_LEN];
+    char namespace[X9_POD_NAMESPACE_LEN];
+    char name[X9_POD_NAME_LEN];
+};
+
+struct pod_identity_set {
+    struct pod_identity *items;
+    size_t count;
+    size_t capacity;
+};
+
+struct runtime_metadata {
+    const struct cgroup_id_set *cgroups;
+    const struct pod_identity_set *pods;
+};
+
 static void cgroup_id_set_free(struct cgroup_id_set *set)
 {
-    free(set->ids);
-    set->ids = NULL;
+    free(set->entries);
+    set->entries = NULL;
     set->count = 0;
     set->capacity = 0;
 }
 
-static bool cgroup_id_set_contains(const struct cgroup_id_set *set, __u64 id)
+static struct cgroup_entry *cgroup_id_set_find_entry(struct cgroup_id_set *set, __u64 id)
 {
     for (size_t i = 0; i < set->count; i++) {
-        if (set->ids[i] == id)
-            return true;
+        if (set->entries[i].id == id)
+            return &set->entries[i];
     }
-    return false;
+    return NULL;
 }
 
-static int cgroup_id_set_add_unique(struct cgroup_id_set *set, __u64 id)
+static const struct cgroup_entry *cgroup_id_set_find_entry_const(const struct cgroup_id_set *set, __u64 id)
 {
-    __u64 *new_ids;
+    for (size_t i = 0; i < set->count; i++) {
+        if (set->entries[i].id == id)
+            return &set->entries[i];
+    }
+    return NULL;
+}
+
+static bool cgroup_id_set_contains(const struct cgroup_id_set *set, __u64 id)
+{
+    return cgroup_id_set_find_entry_const(set, id) != NULL;
+}
+
+static const char *cgroup_id_set_lookup_pod_uid(const struct cgroup_id_set *set, __u64 id)
+{
+    const struct cgroup_entry *entry = cgroup_id_set_find_entry_const(set, id);
+
+    if (!entry || !entry->pod_uid[0])
+        return NULL;
+    return entry->pod_uid;
+}
+
+static int cgroup_id_set_add_unique(struct cgroup_id_set *set, __u64 id, const char *pod_uid)
+{
+    struct cgroup_entry *existing;
+    struct cgroup_entry *new_entries;
     size_t new_capacity;
 
     if (!id)
         return 0;
-    if (cgroup_id_set_contains(set, id))
+    existing = cgroup_id_set_find_entry(set, id);
+    if (existing) {
+        if (!existing->pod_uid[0] && pod_uid && pod_uid[0])
+            snprintf(existing->pod_uid, sizeof(existing->pod_uid), "%s", pod_uid);
         return 0;
+    }
 
     if (set->count == set->capacity) {
         new_capacity = set->capacity ? set->capacity * 2 : 128;
-        new_ids = realloc(set->ids, new_capacity * sizeof(*new_ids));
-        if (!new_ids)
+        new_entries = realloc(set->entries, new_capacity * sizeof(*new_entries));
+        if (!new_entries)
             return -ENOMEM;
-        set->ids = new_ids;
+        set->entries = new_entries;
         set->capacity = new_capacity;
     }
 
-    set->ids[set->count++] = id;
+    set->entries[set->count].id = id;
+    set->entries[set->count].pod_uid[0] = '\0';
+    if (pod_uid && pod_uid[0])
+        snprintf(set->entries[set->count].pod_uid, sizeof(set->entries[set->count].pod_uid), "%s", pod_uid);
+    set->count++;
+
+    return 0;
+}
+
+static void pod_identity_set_free(struct pod_identity_set *set)
+{
+    free(set->items);
+    set->items = NULL;
+    set->count = 0;
+    set->capacity = 0;
+}
+
+static struct pod_identity *pod_identity_set_find(struct pod_identity_set *set, const char *uid)
+{
+    for (size_t i = 0; i < set->count; i++) {
+        if (!strcmp(set->items[i].uid, uid))
+            return &set->items[i];
+    }
+    return NULL;
+}
+
+static const struct pod_identity *pod_identity_set_lookup(const struct pod_identity_set *set, const char *uid)
+{
+    for (size_t i = 0; i < set->count; i++) {
+        if (!strcmp(set->items[i].uid, uid))
+            return &set->items[i];
+    }
+    return NULL;
+}
+
+static int pod_identity_set_add_or_update(struct pod_identity_set *set,
+                                          const char *uid,
+                                          const char *namespace,
+                                          const char *name)
+{
+    struct pod_identity *entry;
+    struct pod_identity *new_items;
+    size_t new_capacity;
+
+    if (!uid || !uid[0] || !namespace || !namespace[0] || !name || !name[0])
+        return 0;
+
+    entry = pod_identity_set_find(set, uid);
+    if (entry) {
+        snprintf(entry->namespace, sizeof(entry->namespace), "%s", namespace);
+        snprintf(entry->name, sizeof(entry->name), "%s", name);
+        return 0;
+    }
+
+    if (set->count == set->capacity) {
+        new_capacity = set->capacity ? set->capacity * 2 : 128;
+        new_items = realloc(set->items, new_capacity * sizeof(*new_items));
+        if (!new_items)
+            return -ENOMEM;
+        set->items = new_items;
+        set->capacity = new_capacity;
+    }
+
+    entry = &set->items[set->count++];
+    snprintf(entry->uid, sizeof(entry->uid), "%s", uid);
+    snprintf(entry->namespace, sizeof(entry->namespace), "%s", namespace);
+    snprintf(entry->name, sizeof(entry->name), "%s", name);
     return 0;
 }
 
@@ -208,14 +328,128 @@ static bool path_is_kubepods_component(const char *path)
     return strstr(name, "kubepods") != NULL;
 }
 
-static int scan_cgroup_tree(const char *root, struct cgroup_id_set *set, bool under_kubepods)
+static bool normalize_pod_uid(const char *candidate, char out[X9_POD_UID_LEN])
+{
+    char hex[33] = { 0 };
+    size_t hex_len = 0;
+
+    if (!candidate || !candidate[0])
+        return false;
+
+    for (const char *p = candidate; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+
+        if (isxdigit(c)) {
+            if (hex_len >= sizeof(hex) - 1)
+                return false;
+            hex[hex_len++] = (char)tolower(c);
+            continue;
+        }
+        if (c == '-' || c == '_')
+            continue;
+        return false;
+    }
+
+    if (hex_len != 32)
+        return false;
+
+    snprintf(out,
+             X9_POD_UID_LEN,
+             "%.8s-%.4s-%.4s-%.4s-%.12s",
+             hex,
+             hex + 8,
+             hex + 12,
+             hex + 16,
+             hex + 20);
+    return true;
+}
+
+static bool extract_pod_uid_from_component(const char *component, char out[X9_POD_UID_LEN])
+{
+    const char *cursor = component;
+
+    if (!component)
+        return false;
+
+    while ((cursor = strstr(cursor, "pod")) != NULL) {
+        char candidate[80] = { 0 };
+        size_t candidate_len = 0;
+
+        for (const char *p = cursor + 3; *p; p++) {
+            unsigned char c = (unsigned char)*p;
+
+            if (isxdigit(c) || c == '-' || c == '_') {
+                if (candidate_len + 1 >= sizeof(candidate))
+                    break;
+                candidate[candidate_len++] = (char)c;
+                continue;
+            }
+            break;
+        }
+
+        candidate[candidate_len] = '\0';
+        if (normalize_pod_uid(candidate, out))
+            return true;
+        cursor += 3;
+    }
+
+    return false;
+}
+
+static bool extract_pod_uid_from_path(const char *path, char out[X9_POD_UID_LEN])
+{
+    const char *start = path;
+    bool found = false;
+
+    if (!path)
+        return false;
+
+    while (*start) {
+        const char *end;
+        size_t len;
+        char component[NAME_MAX + 1] = { 0 };
+
+        while (*start == '/')
+            start++;
+        if (!*start)
+            break;
+
+        end = strchr(start, '/');
+        len = end ? (size_t)(end - start) : strlen(start);
+        if (len >= sizeof(component))
+            len = sizeof(component) - 1;
+        memcpy(component, start, len);
+        component[len] = '\0';
+
+        if (extract_pod_uid_from_component(component, out))
+            found = true;
+
+        if (!end)
+            break;
+        start = end;
+    }
+
+    return found;
+}
+
+static int scan_cgroup_tree(const char *root,
+                            struct cgroup_id_set *set,
+                            bool under_kubepods,
+                            const char *parent_pod_uid)
 {
     DIR *dir;
     struct dirent *entry;
+    char current_pod_uid[X9_POD_UID_LEN] = { 0 };
+    char path_pod_uid[X9_POD_UID_LEN] = { 0 };
     int err;
+
+    if (parent_pod_uid && parent_pod_uid[0])
+        snprintf(current_pod_uid, sizeof(current_pod_uid), "%s", parent_pod_uid);
 
     if (path_is_kubepods_component(root))
         under_kubepods = true;
+    if (extract_pod_uid_from_path(root, path_pod_uid))
+        snprintf(current_pod_uid, sizeof(current_pod_uid), "%s", path_pod_uid);
 
     if (under_kubepods) {
         __u64 cgroup_id = 0;
@@ -224,7 +458,7 @@ static int scan_cgroup_tree(const char *root, struct cgroup_id_set *set, bool un
         if (err)
             return err;
 
-        err = cgroup_id_set_add_unique(set, cgroup_id);
+        err = cgroup_id_set_add_unique(set, cgroup_id, current_pod_uid);
         if (err)
             return err;
     }
@@ -252,7 +486,7 @@ static int scan_cgroup_tree(const char *root, struct cgroup_id_set *set, bool un
         if (!S_ISDIR(st.st_mode))
             continue;
 
-        err = scan_cgroup_tree(child_path, set, under_kubepods);
+        err = scan_cgroup_tree(child_path, set, under_kubepods, current_pod_uid);
         if (err && err != -ENOENT && err != -EACCES) {
             closedir(dir);
             return err;
@@ -260,6 +494,117 @@ static int scan_cgroup_tree(const char *root, struct cgroup_id_set *set, bool un
     }
 
     closedir(dir);
+    return 0;
+}
+
+static bool parse_pod_log_directory_name(const char *name,
+                                         char uid[X9_POD_UID_LEN],
+                                         char namespace[X9_POD_NAMESPACE_LEN],
+                                         char pod_name[X9_POD_NAME_LEN])
+{
+    const char *first_sep;
+    const char *last_sep;
+    size_t namespace_len;
+    size_t pod_len;
+    char uid_candidate[80] = { 0 };
+
+    if (!name || !name[0])
+        return false;
+
+    first_sep = strchr(name, '_');
+    last_sep = strrchr(name, '_');
+    if (!first_sep || !last_sep || first_sep == last_sep)
+        return false;
+
+    namespace_len = (size_t)(first_sep - name);
+    pod_len = (size_t)(last_sep - first_sep - 1);
+    if (!namespace_len || !pod_len)
+        return false;
+    if (namespace_len >= X9_POD_NAMESPACE_LEN || pod_len >= X9_POD_NAME_LEN)
+        return false;
+
+    if (snprintf(uid_candidate, sizeof(uid_candidate), "%s", last_sep + 1) >= (int)sizeof(uid_candidate))
+        return false;
+    if (!normalize_pod_uid(uid_candidate, uid))
+        return false;
+
+    memcpy(namespace, name, namespace_len);
+    namespace[namespace_len] = '\0';
+    memcpy(pod_name, first_sep + 1, pod_len);
+    pod_name[pod_len] = '\0';
+    return true;
+}
+
+static int scan_pod_logs(const char *root, struct pod_identity_set *set)
+{
+    DIR *dir;
+    struct dirent *entry;
+
+    dir = opendir(root);
+    if (!dir) {
+        if (errno == ENOENT || errno == EACCES)
+            return 0;
+        return -errno;
+    }
+
+    while ((entry = readdir(dir))) {
+        struct stat st = { 0 };
+        char path[PATH_MAX];
+        char uid[X9_POD_UID_LEN] = { 0 };
+        char namespace[X9_POD_NAMESPACE_LEN] = { 0 };
+        char pod_name[X9_POD_NAME_LEN] = { 0 };
+        int err;
+
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+
+        if (snprintf(path, sizeof(path), "%s/%s", root, entry->d_name) >= (int)sizeof(path))
+            continue;
+        if (lstat(path, &st))
+            continue;
+        if (!S_ISDIR(st.st_mode))
+            continue;
+
+        if (!parse_pod_log_directory_name(entry->d_name, uid, namespace, pod_name))
+            continue;
+
+        err = pod_identity_set_add_or_update(set, uid, namespace, pod_name);
+        if (err) {
+            closedir(dir);
+            return err;
+        }
+    }
+
+    closedir(dir);
+    return 0;
+}
+
+static int refresh_pod_identities(struct pod_identity_set *set)
+{
+    static const char *bases[] = {
+        "/host/var/log/pods",
+        "/var/log/pods",
+    };
+    struct pod_identity_set next_set = { 0 };
+    bool found_base = false;
+    int err;
+
+    for (size_t i = 0; i < sizeof(bases) / sizeof(bases[0]); i++) {
+        if (!is_directory(bases[i]))
+            continue;
+        found_base = true;
+        err = scan_pod_logs(bases[i], &next_set);
+        if (err) {
+            pod_identity_set_free(&next_set);
+            return err;
+        }
+    }
+
+    if (!found_base)
+        pod_identity_set_free(&next_set);
+
+    pod_identity_set_free(set);
+    *set = next_set;
     return 0;
 }
 
@@ -278,7 +623,7 @@ static int collect_kubernetes_cgroups(struct cgroup_id_set *set)
         if (!is_directory(bases[i]))
             continue;
         found_base = true;
-        err = scan_cgroup_tree(bases[i], set, false);
+        err = scan_cgroup_tree(bases[i], set, false, NULL);
         if (err)
             return err;
     }
@@ -305,9 +650,11 @@ static int sync_allowed_cgroups(int map_fd, struct cgroup_id_set *active_set, bo
     }
 
     for (size_t i = 0; i < next_set.count; i++) {
-        if (cgroup_id_set_contains(active_set, next_set.ids[i]))
+        __u64 cgroup_id = next_set.entries[i].id;
+
+        if (cgroup_id_set_contains(active_set, cgroup_id))
             continue;
-        if (bpf_map_update_elem(map_fd, &next_set.ids[i], &allow_value, BPF_ANY)) {
+        if (bpf_map_update_elem(map_fd, &cgroup_id, &allow_value, BPF_ANY)) {
             err = -errno;
             cgroup_id_set_free(&next_set);
             return err;
@@ -317,9 +664,11 @@ static int sync_allowed_cgroups(int map_fd, struct cgroup_id_set *active_set, bo
     }
 
     for (size_t i = 0; i < active_set->count; i++) {
-        if (cgroup_id_set_contains(&next_set, active_set->ids[i]))
+        __u64 cgroup_id = active_set->entries[i].id;
+
+        if (cgroup_id_set_contains(&next_set, cgroup_id))
             continue;
-        if (bpf_map_delete_elem(map_fd, &active_set->ids[i]) && errno != ENOENT) {
+        if (bpf_map_delete_elem(map_fd, &cgroup_id) && errno != ENOENT) {
             err = -errno;
             cgroup_id_set_free(&next_set);
             return err;
@@ -335,12 +684,15 @@ static int sync_allowed_cgroups(int map_fd, struct cgroup_id_set *active_set, bo
 
 static int on_event(void *ctx, void *data, size_t data_sz)
 {
+    const struct runtime_metadata *metadata = ctx;
     const struct x9_conn_event *event = data;
     char addr_text[INET6_ADDRSTRLEN] = "-";
     char iso_ts[40] = "-";
+    char pod_namespace[X9_POD_NAMESPACE_LEN] = "-";
+    char pod_name[X9_POD_NAME_LEN] = "-";
+    const char *pod_uid;
+    const struct pod_identity *pod_identity;
     unsigned long long unix_ns;
-
-    (void)ctx;
 
     if (!output_file)
         return 0;
@@ -351,8 +703,19 @@ static int on_event(void *ctx, void *data, size_t data_sz)
     unix_ns = monotonic_to_unix_ns(event->ts_ns);
     format_iso8601_utc(unix_ns, iso_ts, sizeof(iso_ts));
 
+    pod_uid = NULL;
+    pod_identity = NULL;
+    if (metadata && metadata->cgroups)
+        pod_uid = cgroup_id_set_lookup_pod_uid(metadata->cgroups, event->cgroup_id);
+    if (pod_uid && metadata && metadata->pods)
+        pod_identity = pod_identity_set_lookup(metadata->pods, pod_uid);
+    if (pod_identity) {
+        snprintf(pod_namespace, sizeof(pod_namespace), "%s", pod_identity->namespace);
+        snprintf(pod_name, sizeof(pod_name), "%s", pod_identity->name);
+    }
+
     fprintf(output_file,
-            "\"%llu\",\"%llu\",\"%s\",\"%s\",\"%u\",\"%u\",\"%u\",\"%s\",\"%d\",\"%d\",\"%d\",\"%u\",\"%s\",\"%u\",\"%u\"\n",
+            "\"%llu\",\"%llu\",\"%s\",\"%s\",\"%u\",\"%u\",\"%u\",\"%s\",\"%d\",\"%d\",\"%d\",\"%u\",\"%s\",\"%u\",\"%u\",\"%s\",\"%s\"\n",
             (unsigned long long)event->ts_ns,
             unix_ns,
             iso_ts,
@@ -367,7 +730,9 @@ static int on_event(void *ctx, void *data, size_t data_sz)
             event->family,
             addr_text,
             event->port,
-            event->addrlen);
+            event->addrlen,
+            pod_namespace,
+            pod_name);
 
     return 0;
 }
@@ -388,6 +753,11 @@ int main(int argc, char **argv)
     int map_fd;
     int allowed_cgroups_map_fd;
     struct cgroup_id_set synced_cgroups = { 0 };
+    struct pod_identity_set pod_identities = { 0 };
+    struct runtime_metadata metadata = {
+        .cgroups = &synced_cgroups,
+        .pods = &pod_identities,
+    };
     time_t next_cgroup_sync = 0;
     bool sync_changed = false;
     int err;
@@ -436,7 +806,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    rb = ring_buffer__new(map_fd, on_event, NULL, NULL);
+    rb = ring_buffer__new(map_fd, on_event, &metadata, NULL);
     if (!rb) {
         fprintf(stderr, "failed to create event reader\n");
         bpf_object__close(obj);
@@ -508,6 +878,18 @@ int main(int argc, char **argv)
     next_cgroup_sync = time(NULL) + CGROUP_SYNC_INTERVAL_SEC;
     printf("Loaded %zu Kubernetes cgroups into allowlist\n", synced_cgroups.count);
 
+    {
+        int pods_err = refresh_pod_identities(&pod_identities);
+
+        if (pods_err) {
+            fprintf(stderr,
+                    "failed to load pod metadata from /host/var/log/pods: %s\n",
+                    strerror(pods_err < 0 ? -pods_err : pods_err));
+        } else if (pod_identities.count) {
+            printf("Loaded %zu pod identities\n", pod_identities.count);
+        }
+    }
+
     err = 0;
     printf("Syscall kprobes attached. Writing events to %s (Ctrl+C to exit)\n", output_path);
     while (!stop) {
@@ -524,6 +906,17 @@ int main(int argc, char **argv)
             }
             if (sync_changed)
                 printf("Refreshed Kubernetes cgroup allowlist: %zu entries\n", synced_cgroups.count);
+
+            {
+                int pods_err = refresh_pod_identities(&pod_identities);
+
+                if (pods_err) {
+                    fprintf(stderr,
+                            "failed to refresh pod metadata from /host/var/log/pods: %s\n",
+                            strerror(pods_err < 0 ? -pods_err : pods_err));
+                }
+            }
+
             next_cgroup_sync = now + CGROUP_SYNC_INTERVAL_SEC;
         }
 
@@ -541,6 +934,7 @@ int main(int argc, char **argv)
 cleanup:
     for (size_t i = 0; i < link_count; i++)
         bpf_link__destroy(links[i]);
+    pod_identity_set_free(&pod_identities);
     cgroup_id_set_free(&synced_cgroups);
     ring_buffer__free(rb);
     bpf_object__close(obj);

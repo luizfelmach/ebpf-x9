@@ -35,6 +35,9 @@ spec:
             - name: cgroup
               mountPath: /host/sys/fs/cgroup
               readOnly: true
+            - name: pod-logs
+              mountPath: /host/var/log/pods
+              readOnly: true
       volumes:
         - name: events
           hostPath:
@@ -44,3 +47,7 @@ spec:
           hostPath:
             path: /sys/fs/cgroup
             type: Directory
+        - name: pod-logs
+          hostPath:
+            path: /var/log/pods
+            type: DirectoryOrCreate

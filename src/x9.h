@@ -13,6 +13,7 @@ enum x9_event_type {
 
 struct x9_conn_event {
     __u64 ts_ns;
+    __u64 cgroup_id;
     __u32 pid;
     __u32 tid;
     __u32 uid;
