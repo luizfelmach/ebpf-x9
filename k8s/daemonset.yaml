@@ -32,8 +32,15 @@ spec:
           volumeMounts:
             - name: events
               mountPath: /var/log/x9
+            - name: cgroup
+              mountPath: /host/sys/fs/cgroup
+              readOnly: true
       volumes:
         - name: events
           hostPath:
             path: /var/log/x9
             type: DirectoryOrCreate
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory

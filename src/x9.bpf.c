@@ -69,6 +69,27 @@ struct {
     __uint(max_entries, 16384);
 } accept_inflight SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u64);
+    __type(value, __u8);
+    __uint(max_entries, 131072);
+} allowed_cgroups SEC(".maps");
+
+static __always_inline int is_allowed_cgroup(void)
+{
+    __u64 cgroup_id = bpf_get_current_cgroup_id();
+    __u8 *allowed;
+
+    if (!cgroup_id)
+        return 0;
+
+    allowed = bpf_map_lookup_elem(&allowed_cgroups, &cgroup_id);
+    if (!allowed || !*allowed)
+        return 0;
+    return 1;
+}
+
 static __always_inline __u16 clamp_addrlen(__u32 addrlen)
 {
     if (addrlen > 0xffff)
@@ -142,7 +163,7 @@ static __always_inline int submit_connect_event(long ret)
     if (!args)
         return 0;
 
-    if (ret == 0) {
+    if (ret == 0 && is_allowed_cgroup()) {
         __u32 addrlen = args->addrlen > 0 ? (__u32)args->addrlen : 0;
 
         event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
@@ -187,7 +208,7 @@ static __always_inline int submit_accept_event(long ret)
     if (!args)
         return 0;
 
-    if (ret >= 0) {
+    if (ret >= 0 && is_allowed_cgroup()) {
         if (args->user_addrlen) {
             __u32 len = 0;
 
