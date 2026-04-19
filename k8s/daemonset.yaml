@@ -14,6 +14,13 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: x9
           image: x9:latest

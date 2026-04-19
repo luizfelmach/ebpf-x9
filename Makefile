@@ -18,7 +18,8 @@ IFACE ?= eth0
 OUTPUT_FILE ?= /tmp/tc-events.ndjson
 
 IMAGE ?= x9:latest
-KIND_CLUSTER ?= kind
+KIND_CLUSTER ?= cluster-x9
+KIND_CONFIG ?= kind/cluster-x9.yaml
 K8S_MANIFEST ?= k8s/daemonset.yaml
 K8S_NAMESPACE ?= kube-system
 DAEMONSET_NAME ?= x9
@@ -39,7 +40,7 @@ help: ## Show this help message
 	@printf "\n\033[1mContainer Image\033[0m\n"
 	@printf "  \033[36m%-14s\033[0m %s\n" "docker-build" "Build Docker image (no cache)"
 	@printf "\n\033[1mKind Cluster\033[0m\n"
-	@printf "  \033[36m%-14s\033[0m %s\n" "kind-up" "Create a kind cluster"
+	@printf "  \033[36m%-14s\033[0m %s\n" "kind-up" "Create a 3-node kind cluster"
 	@printf "  \033[36m%-14s\033[0m %s\n" "kind-down" "Delete a kind cluster"
 	@printf "  \033[36m%-14s\033[0m %s\n" "kind-reset" "Recreate a kind cluster"
 	@printf "\n\033[1mKubernetes Ops\033[0m\n"
@@ -95,8 +96,8 @@ clean: ## Remove local build artifacts
 docker-build: ## Build Docker image (no cache)
 	docker build --no-cache -t $(IMAGE) .
 
-kind-up: ## Create a kind cluster
-	kind create cluster --name $(KIND_CLUSTER)
+kind-up: ## Create a 3-node kind cluster
+	kind create cluster --name $(KIND_CLUSTER) --config $(KIND_CONFIG)
 
 kind-down: ## Delete a kind cluster
 	kind delete cluster --name $(KIND_CLUSTER)
@@ -118,7 +119,7 @@ k8s-status:
 k8s-logs:
 	kubectl -n $(K8S_NAMESPACE) logs -l app=$(DAEMONSET_NAME) -f --tail=$(TAIL)
 
-deploy-kind: docker-build kind-load k8s-apply k8s-restart k8s-status
+deploy-kind: kind-load k8s-apply k8s-restart k8s-status
 
 deploy: ## Build image and deploy to kind
 	$(MAKE) deploy-kind
