@@ -28,12 +28,17 @@ KIND_CLUSTER ?= cluster-x9
 KIND_CONFIG ?= kind/cluster-x9.yaml
 K8S_MANIFEST ?= k8s/daemonset.yaml
 K8S_NGINX_MANIFEST ?= k8s/nginx.yaml
+K8S_OBSERVABILITY_MANIFEST ?= k8s/observability.yaml
 K8S_NAMESPACE ?= kube-system
+OBS_NAMESPACE ?= observability
 DAEMONSET_NAME ?= x9
 TAIL ?= 100
 EVENT_FILE ?= /var/log/x9/events.json
+GRAFANA_SERVICE ?= grafana
+GRAFANA_LOCAL_PORT ?= 3000
+GRAFANA_REMOTE_PORT ?= 3000
 
-.PHONY: help tools build build-bpf build-user run clean docker-build kind-up kind-down kind-reset kind-load k8s-apply k8s-restart k8s-status k8s-logs deploy-kind deploy status logs tail undeploy redeploy
+.PHONY: help tools build build-bpf build-user run clean docker-build kind-up kind-down kind-reset kind-load k8s-apply k8s-restart k8s-restart-observability k8s-status k8s-logs deploy-kind deploy status logs tail port-forward undeploy redeploy
 
 help: ## Show this help message
 	@printf "\n\033[1mX9 eBPF Connection Monitor\033[0m\n"
@@ -55,6 +60,7 @@ help: ## Show this help message
 	@printf "  \033[36m%-14s\033[0m %s\n" "status" "Show daemonset and pod status"
 	@printf "  \033[36m%-14s\033[0m %s\n" "logs" "Follow DaemonSet logs"
 	@printf "  \033[36m%-14s\033[0m %s\n" "tail" "Tail NDJSON event file in pod"
+	@printf "  \033[36m%-14s\033[0m %s\n" "port-forward" "Expose Grafana on localhost"
 	@printf "  \033[36m%-14s\033[0m %s\n" "redeploy" "Reapply and restart DaemonSet"
 	@printf "  \033[36m%-14s\033[0m %s\n" "undeploy" "Delete Kubernetes resources"
 	@printf "\nExamples:\n"
@@ -115,10 +121,14 @@ kind-load:
 	kind load docker-image $(IMAGE) --name $(KIND_CLUSTER)
 
 k8s-apply:
-	kubectl apply -f $(K8S_MANIFEST) -f $(K8S_NGINX_MANIFEST)
+	kubectl apply -f $(K8S_MANIFEST) -f $(K8S_NGINX_MANIFEST) -f $(K8S_OBSERVABILITY_MANIFEST)
 
 k8s-restart:
 	kubectl -n $(K8S_NAMESPACE) rollout restart daemonset/$(DAEMONSET_NAME)
+
+k8s-restart-observability:
+	kubectl -n $(OBS_NAMESPACE) rollout restart deployment/loki deployment/grafana
+	kubectl -n $(OBS_NAMESPACE) rollout restart daemonset/promtail
 
 k8s-status:
 	kubectl -n $(K8S_NAMESPACE) rollout status daemonset/$(DAEMONSET_NAME)
@@ -126,7 +136,7 @@ k8s-status:
 k8s-logs:
 	kubectl -n $(K8S_NAMESPACE) logs -l app=$(DAEMONSET_NAME) -f --tail=$(TAIL)
 
-deploy-kind: kind-load k8s-apply k8s-restart k8s-status
+deploy-kind: kind-load k8s-apply k8s-restart k8s-restart-observability k8s-status
 
 deploy: ## Build image and deploy to kind
 	$(MAKE) deploy-kind
@@ -146,9 +156,13 @@ tail: ## Tail NDJSON event file in pod
 	fi; \
 	kubectl -n $(K8S_NAMESPACE) exec -it "$$POD" -- tail -f $(EVENT_FILE)
 
+port-forward: ## Expose Grafana on localhost
+	kubectl -n $(OBS_NAMESPACE) port-forward svc/$(GRAFANA_SERVICE) $(GRAFANA_LOCAL_PORT):$(GRAFANA_REMOTE_PORT)
+
 undeploy: ## Delete Kubernetes resources
 	kubectl delete -f $(K8S_MANIFEST) --ignore-not-found
 	kubectl delete -f $(K8S_NGINX_MANIFEST) --ignore-not-found
+	kubectl delete -f $(K8S_OBSERVABILITY_MANIFEST) --ignore-not-found
 
 redeploy: ## Reapply and restart DaemonSet
 	$(MAKE) k8s-apply
